@@ -1,8 +1,8 @@
 # CODEOWNERS (demo). Real repo uses @EdGraph-OSS/core-team; a personal repo
 # has no teams, so the demo uses a collaborator's username instead.
-/packages/oea/   @__CODEOWNER__
-/dags/           @__CODEOWNER__
-/cloud/          @__CODEOWNER__
-/.github/        @__CODEOWNER__
-/configs/        @__CODEOWNER__
-/docs/           @__CODEOWNER__
+/packages/oea/   @akshatjain29500
+/dags/           @akshatjain29500
+/cloud/          @akshatjain29500
+/.github/        @akshatjain29500
+/configs/        @akshatjain29500
+/docs/           @akshatjain29500
