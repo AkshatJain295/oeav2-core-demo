@@ -1,0 +1,303 @@
+# Reusable workflow: validates the request, then triggers the OEA deployment
+# notebook remotely via Fabric's "Run notebook" job API and polls until it
+# finishes. Not run directly; called by deploy_dev.yml, deploy_qa.yml and
+# deploy_prod.yml.
+#
+# Two jobs on purpose:
+#   validate - cheap checks, no environment, so it runs BEFORE any approval
+#              prompt. Reviewers are never asked to approve a deploy that was
+#              going to be rejected anyway.
+#   deploy   - bound to a GitHub Environment (approval gate for Prod).
+name: Deploy OEA Notebook (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      target_config_name:
+        description: "Must match a configs/<name>.json file on main"
+        required: true
+        type: string
+      core_release_tag:
+        description: "OEAv2-Core release tag to deploy"
+        required: true
+        type: string
+      environment_name:
+        description: "GitHub Environment to run under (Prod environments carry the required reviewers)"
+        required: true
+        type: string
+      allow_dev_tags:
+        description: "true for dev/QA (may deploy .dev builds), false for Prod"
+        required: false
+        type: boolean
+        default: false
+      require_protected_environment:
+        description: "true for Prod: refuse to run unless the environment has required reviewers"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "true = run every check and approval and build the request, but make no call to Fabric"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # Configs are read from main at runtime by the notebook, so main is
+      # the right place to check that the target exists.
+      - name: Checkout configs from main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: configs
+
+      - name: Validate target and release tags
+        env:
+          TARGET: ${{ inputs.target_config_name }}
+          CORE_TAG: ${{ inputs.core_release_tag }}
+          ALLOW_DEV: ${{ inputs.allow_dev_tags }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ERRORS=0
+          fail() { echo "::error::$1"; ERRORS=$((ERRORS + 1)); }
+
+          CLEAN='^v[0-9]{4}\.[0-9]{2}\.[0-9]+$'
+          DEV='^v[0-9]{4}\.[0-9]{2}\.[0-9]+\.dev[0-9]+$'
+
+          # --- target config ---
+          if ! [[ "$TARGET" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            fail "target_config_name '$TARGET' is invalid (lowercase letters, digits and hyphens only)."
+          elif [ ! -f "configs/${TARGET}.json" ]; then
+            fail "configs/${TARGET}.json does not exist on main. Check the name, or merge the config PR first."
+          elif ! jq -e . "configs/${TARGET}.json" >/dev/null 2>&1; then
+            fail "configs/${TARGET}.json on main is not valid JSON."
+          fi
+
+          # --- tag format ---
+          check_tag() {
+            local label="$1" tag="$2"
+            if [[ "$tag" =~ $CLEAN ]]; then
+              return 0
+            elif [[ "$tag" =~ $DEV ]]; then
+              if [ "$ALLOW_DEV" != "true" ]; then
+                fail "$label '$tag' is a dev release. Dev releases can only be deployed to dev/QA, never Prod."
+              fi
+            else
+              fail "$label '$tag' is not a valid release tag (expected vYYYY.MM.<n>, or vYYYY.MM.<n>.dev<run> for dev/QA)."
+            fi
+            return 0
+          }
+
+          check_tag "core_release_tag" "$CORE_TAG"
+
+          # --- the release must actually exist in this repo ---
+          if [[ "$CORE_TAG" =~ $CLEAN || "$CORE_TAG" =~ $DEV ]]; then
+            if INFO=$(gh release view "$CORE_TAG" --json isPrerelease 2>/dev/null); then
+              if [ "$ALLOW_DEV" != "true" ] && [ "$(echo "$INFO" | jq -r '.isPrerelease')" = "true" ]; then
+                fail "core release '$CORE_TAG' is marked pre-release and can't be deployed to Prod."
+              fi
+            else
+              fail "core release '$CORE_TAG' was not found in $GITHUB_REPOSITORY. Run OEA Release Publisher first."
+            fi
+          fi
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "Validation failed with $ERRORS error(s)."
+            exit 1
+          fi
+          echo "Validation passed: target '$TARGET', core release '$CORE_TAG'."
+          MODULES=$(jq -r '(.modules // {}) | to_entries | map(select(.value == true) | .key) | join(", ")' "configs/${TARGET}.json")
+          {
+            echo "### Deploy request"
+            echo "- Target: \`$TARGET\`"
+            echo "- Core release: \`$CORE_TAG\`"
+            echo "- Modules enabled: ${MODULES:-none}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      # GitHub silently CREATES any environment a job references if it doesn't
+      # exist, with no reviewers, which would skip the Prod approval gate
+      # entirely. Fail closed on that.
+      - name: Verify environment has required reviewers
+        if: ${{ inputs.require_protected_environment }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENV_NAME: ${{ inputs.environment_name }}
+        run: |
+          set +e
+          BODY=$(gh api "repos/${GITHUB_REPOSITORY}/environments/${ENV_NAME}" 2>err.txt)
+          RC=$?
+          set -e
+
+          if [ "$RC" -ne 0 ]; then
+            if grep -q "404" err.txt; then
+              echo "::error::GitHub Environment '$ENV_NAME' does not exist. Running would auto-create it with no approval gate. Create it with required reviewers first."
+              exit 1
+            fi
+            echo "::warning::Could not verify protection rules on environment '$ENV_NAME' ($(cat err.txt)). Confirm required reviewers are configured."
+            exit 0
+          fi
+
+          REVIEWER_RULES=$(echo "$BODY" | jq '[.protection_rules[]? | select(.type=="required_reviewers")] | length')
+          if [ "$REVIEWER_RULES" -eq 0 ]; then
+            echo "::error::Environment '$ENV_NAME' has no required reviewers. Refusing to deploy to Prod without an approval gate."
+            exit 1
+          fi
+          echo "Environment '$ENV_NAME' has required reviewers configured."
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: ${{ inputs.environment_name }}
+    # One deploy per target at a time; a second request queues rather than
+    # racing the first.
+    concurrency:
+      group: oea-deploy-${{ inputs.target_config_name }}
+      cancel-in-progress: false
+
+    steps:
+      # The request body is built (and printed) on every run, dry or not, so a
+      # dry run shows exactly what a real run would send.
+      - name: Build deployment request
+        env:
+          TARGET: ${{ inputs.target_config_name }}
+          CORE_TAG: ${{ inputs.core_release_tag }}
+        run: |
+          # edgraph_release_tag is deliberately not sent: the notebook defaults it
+          # to blank, which makes it a Core-only run (EdGraph is neither fetched
+          # nor deployed).
+          jq -n \
+            --arg tcn "$TARGET" \
+            --arg core "$CORE_TAG" \
+            '{
+              executionData: {
+                parameters: {
+                  target_config_name: { value: $tcn,  type: "string" },
+                  core_release_tag:   { value: $core, type: "string" }
+                }
+              }
+            }' > request.json
+          echo "Request body for the Fabric 'Run notebook' call:"
+          jq . request.json
+
+      - name: Get Fabric access token
+        if: ${{ !inputs.dry_run }}
+        id: get_token
+        env:
+          SERVICE_PRINCIPAL_TENANT_ID: ${{ secrets.SERVICE_PRINCIPAL_TENANT_ID }}
+          SERVICE_PRINCIPAL_CLIENT_ID: ${{ secrets.SERVICE_PRINCIPAL_CLIENT_ID }}
+          SERVICE_PRINCIPAL_CLIENT_SECRET: ${{ secrets.SERVICE_PRINCIPAL_CLIENT_SECRET }}
+        run: |
+          # Same client-credentials pattern already used elsewhere in this
+          # repo (see the disabled notebook_update.yml/manual.yml).
+          for VAR in SERVICE_PRINCIPAL_TENANT_ID SERVICE_PRINCIPAL_CLIENT_ID SERVICE_PRINCIPAL_CLIENT_SECRET; do
+            if [ -z "${!VAR}" ]; then
+              echo "::error::secret $VAR is empty or not available to this environment"
+              exit 1
+            fi
+          done
+
+          RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/${SERVICE_PRINCIPAL_TENANT_ID}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${SERVICE_PRINCIPAL_CLIENT_ID}" \
+            -d "client_secret=${SERVICE_PRINCIPAL_CLIENT_SECRET}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials")
+
+          ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
+          if [ -n "$ERROR" ]; then
+            echo "::error::Token request failed: $(echo "$RESPONSE" | jq -r '.error_description')"
+            exit 1
+          fi
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::No access_token in response"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger deployment notebook run
+        if: ${{ !inputs.dry_run }}
+        id: trigger
+        env:
+          TOKEN: ${{ steps.get_token.outputs.token }}
+          DEPLOYMENT_NOTEBOOK_WORKSPACE_ID: ${{ secrets.DEPLOYMENT_NOTEBOOK_WORKSPACE_ID }}
+          DEPLOYMENT_NOTEBOOK_ID: ${{ secrets.DEPLOYMENT_NOTEBOOK_ID }}
+        run: |
+          for VAR in DEPLOYMENT_NOTEBOOK_WORKSPACE_ID DEPLOYMENT_NOTEBOOK_ID; do
+            if [ -z "${!VAR}" ]; then
+              echo "::error::secret $VAR is empty or not available to this environment"
+              exit 1
+            fi
+          done
+
+          HTTP_CODE=$(curl -s -D headers.txt -o body.json -w "%{http_code}" -X POST \
+            "https://api.fabric.microsoft.com/v1/workspaces/${DEPLOYMENT_NOTEBOOK_WORKSPACE_ID}/items/${DEPLOYMENT_NOTEBOOK_ID}/jobs/instances?jobType=RunNotebook" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data @request.json)
+
+          if [ "$HTTP_CODE" != "202" ]; then
+            echo "::error::Failed to trigger notebook run (HTTP $HTTP_CODE)"
+            cat body.json
+            exit 1
+          fi
+
+          LOCATION=$(grep -i '^location:' headers.txt | sed 's/^[Ll]ocation: //' | tr -d '\r\n')
+          if [ -z "$LOCATION" ]; then
+            echo "::error::No Location header returned to poll for job status"
+            exit 1
+          fi
+          echo "location=$LOCATION" >> "$GITHUB_OUTPUT"
+          echo "Triggered. Polling: $LOCATION"
+
+      - name: Poll until the notebook run finishes
+        if: ${{ !inputs.dry_run }}
+        env:
+          TOKEN: ${{ steps.get_token.outputs.token }}
+          LOCATION: ${{ steps.trigger.outputs.location }}
+        run: |
+          # 60 attempts * 15s = up to 15 minutes. Adjust if real deploys
+          # (e.g. a first-time Prod deploy with many modules) run longer.
+          for i in $(seq 1 60); do
+            sleep 15
+            STATUS_JSON=$(curl -s "$LOCATION" -H "Authorization: Bearer $TOKEN")
+            STATUS=$(echo "$STATUS_JSON" | jq -r '.status // "Unknown"')
+            echo "Attempt $i: status=$STATUS"
+
+            if [ "$STATUS" == "Completed" ]; then
+              echo "Deployment succeeded."
+              exit 0
+            fi
+            if [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ] || [ "$STATUS" == "Deduped" ]; then
+              echo "::error::Deployment did not succeed, status: $STATUS"
+              echo "$STATUS_JSON" | jq .
+              exit 1
+            fi
+          done
+
+          echo "::error::Timed out after 15 minutes waiting for the notebook run to finish"
+          exit 1
+
+      - name: Dry run complete
+        if: ${{ inputs.dry_run }}
+        env:
+          TARGET: ${{ inputs.target_config_name }}
+          CORE_TAG: ${{ inputs.core_release_tag }}
+          ENV_NAME: ${{ inputs.environment_name }}
+        run: |
+          {
+            echo "### Dry run: nothing was deployed"
+            echo "All checks passed and the approval gate for environment \`$ENV_NAME\` was cleared."
+            echo "The request above was built but **not sent**. No call was made to Entra ID or Fabric."
+            echo "Re-run with dry_run unchecked to deploy \`$CORE_TAG\` to \`$TARGET\`."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "DRY RUN: would deploy $CORE_TAG to $TARGET. No call was made to Entra ID or Fabric."

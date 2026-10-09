@@ -1,0 +1,71 @@
+name: PR Checks
+
+# Enforces the branching/naming conventions and validates tenant configs.
+# Until the branch rulesets are in place these show as visible pass/fail checks;
+# once they are added as required status checks they become blocking.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main, qa, "release/*"]
+
+permissions:
+  contents: read
+
+jobs:
+  conventions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title and branch flow
+        env:
+          HEAD: ${{ github.head_ref }}
+          BASE: ${{ github.base_ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          FAILED=0
+          err() { echo "::error::$1"; FAILED=1; }
+
+          TYPES='feature|bugfix|hotfix|doc|chore'
+          TITLE_RE="^\\[(${TYPES})\\][[:space:]]+[^[:space:]].*"
+          TYPED_BRANCH_RE="^(${TYPES})/[^/]+/.+\$"
+          HEAD_TYPE_RE="^(${TYPES})/"
+
+          # 1. Title must start with the change type, e.g. "[feature] Add metric"
+          TITLE_TYPE=""
+          if [[ "$TITLE" =~ $TITLE_RE ]]; then
+            TITLE_TYPE="${BASH_REMATCH[1]}"
+          else
+            err "PR title must start with [feature], [bugfix], [hotfix], [doc] or [chore], followed by a description (got: '$TITLE')."
+          fi
+
+          # 2. A typed branch (feature/dev/x) must use the matching title prefix
+          if [[ "$HEAD" =~ $HEAD_TYPE_RE ]] && [ -n "$TITLE_TYPE" ] && [ "${BASH_REMATCH[1]}" != "$TITLE_TYPE" ]; then
+            err "Branch '$HEAD' is a ${BASH_REMATCH[1]} branch but the title says [$TITLE_TYPE]."
+          fi
+
+          # 3. Branch flow: feature -> qa -> main, fixes into release branches
+          case "$BASE" in
+            qa)
+              [[ "$HEAD" =~ $TYPED_BRANCH_RE ]] || err "PRs into 'qa' must come from a <type>/<developer>/<description> branch (got '$HEAD')."
+              ;;
+            main)
+              if [[ "$HEAD" != "qa" ]] && ! [[ "$HEAD" =~ ^hotfix/[^/]+/.+$ ]]; then
+                err "PRs into 'main' must come from 'qa' (promotion) or a hotfix/ branch (backport). Got '$HEAD'."
+              fi
+              ;;
+            release/*)
+              [[ "$BASE" =~ ^release/[0-9]{4}-[0-9]{2}$ ]] || err "Release branch '$BASE' must be named release/YYYY-MM."
+              [[ "$HEAD" =~ ^(hotfix|bugfix)/[^/]+/.+$ ]] || err "PRs into a release branch must come from hotfix/ or bugfix/ branches (got '$HEAD')."
+              ;;
+          esac
+
+          if [ "$FAILED" -eq 0 ]; then
+            echo "Conventions OK: '$HEAD' -> '$BASE', title type [$TITLE_TYPE]."
+          fi
+          exit "$FAILED"
+
+  tenant-configs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tenant configs
+        run: python3 .github/scripts/validate_tenant_configs.py configs

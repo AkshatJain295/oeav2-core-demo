@@ -1,0 +1,30 @@
+name: Deploy to QA
+
+# Deploys a build (a .dev release cut from the qa branch, or a production tag)
+# to the QA workspace.
+on:
+  workflow_dispatch:
+    inputs:
+      core_release_tag:
+        description: "e.g. v2026.09.1.dev12 (cut from qa) or v2026.09.1"
+        required: true
+      dry_run:
+        description: "Run every check and approval but make no call to Fabric"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy-qa:
+    uses: ./.github/workflows/deploy-notebook.yml
+    with:
+      target_config_name: "qa"
+      core_release_tag: ${{ inputs.core_release_tag }}
+      environment_name: "qa"
+      allow_dev_tags: true
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit

@@ -1,0 +1,47 @@
+name: Deploy to Prod (per tenant)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: "Must match a configs/<tenant>.json file on main, e.g. tenant-a"
+        required: true
+      core_release_tag:
+        description: "Production tag only (vYYYY.MM.<n>), e.g. v2026.09.1"
+        required: true
+      dry_run:
+        description: "Run every check and approval but make no call to Fabric"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # A run dispatched from another branch would use THAT branch's copy of the
+  # workflow files. Prod deploys must always use the reviewed version on main.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require dispatch from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Prod deploys must be dispatched from main (got $GITHUB_REF). Set 'Use workflow from' to main."
+            exit 1
+          fi
+
+  deploy-prod:
+    needs: guard
+    uses: ./.github/workflows/deploy-notebook.yml
+    with:
+      target_config_name: ${{ inputs.tenant }}
+      core_release_tag: ${{ inputs.core_release_tag }}
+      # Environment name = tenant name, by convention (matches configs/<tenant>.json).
+      # The environment carries that tenant's required reviewers.
+      environment_name: ${{ inputs.tenant }}
+      allow_dev_tags: false
+      require_protected_environment: true
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
