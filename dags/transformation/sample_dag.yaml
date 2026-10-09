@@ -1,0 +1,5 @@
+# Stand-in DSL. The release publisher zips `dags/` into dags.zip.
+name: sample_dag
+steps:
+  - read: raw.students
+  - write: silver.students

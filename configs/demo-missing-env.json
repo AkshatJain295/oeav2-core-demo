@@ -1,0 +1,13 @@
+{
+  "_comment": "DEMO DATA - fake GUID, not a real workspace",
+  "workspace": "50000000-0000-4000-8000-000000000005",
+  "modules": {
+    "fetch_releases": true,
+    "create_folders": false,
+    "create_environment": true,
+    "create_lakehouses": true,
+    "deploy_notebooks": true,
+    "deploy_dashboards": false,
+    "bootstrap_and_rebind": false
+  }
+}
