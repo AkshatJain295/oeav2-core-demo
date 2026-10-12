@@ -1,11 +1,19 @@
-# Reusable workflow: validates the request, triggers the OEA deployment notebook in
-# Fabric via the "Run notebook" job API, polls until it finishes, and records the
-# outcome in the deployment log. Not run directly; called by deploy_dev.yml,
-# deploy_qa.yml and deploy_prod.yml.
+# Reusable workflow: validates the request, finds the OEA deployment notebook INSIDE the
+# target workspace, runs it there via Fabric's "Run notebook" job API, polls until it
+# finishes, and records the outcome in the deployment log. Not run directly; called by
+# deploy_dev.yml, deploy_qa.yml and deploy_prod.yml.
 #
-# Nothing about a target is stored in the repo. Whoever runs a deploy supplies the
-# workspace ID, the module flags and the release tag, and reviewers approve exactly
-# those values (they are shown in the run summary before the approval prompt).
+# Each workspace has its own copy of the deployment notebook (same display name in every
+# workspace), so the notebook always runs in the workspace it deploys into. Nothing about
+# a target is stored in the repo: whoever runs a deploy supplies the workspace ID, the
+# Entra tenant, the module flags and the release tag.
+#
+# Credentials, and where they live:
+#   - To START the notebook in a workspace: a service principal whose secret is a GitHub
+#     secret (SERVICE_PRINCIPAL_*, or a named set SPN_<SET>_* for a client with its own
+#     app). The form only says WHICH set to use and which Entra tenant; never the secret.
+#   - Anything the notebook needs WHILE running (GitHub PAT for releases, etc.) lives in
+#     that workspace's Azure Key Vault and is referenced by name inside the notebook.
 #
 # Three jobs:
 #   validate - cheap checks, no environment, so it runs BEFORE any approval prompt.
@@ -24,6 +32,16 @@ on:
         description: "GUID of the Fabric workspace to deploy into"
         required: true
         type: string
+      entra_tenant_id:
+        description: "Microsoft Entra tenant ID that owns the workspace. Blank = the default tenant (the SERVICE_PRINCIPAL_TENANT_ID secret)"
+        required: false
+        type: string
+        default: ""
+      credential_set:
+        description: "Which GitHub secrets hold the service principal for this workspace. Blank = the default SERVICE_PRINCIPAL_* secrets; NAME = SPN_NAME_CLIENT_ID / SPN_NAME_CLIENT_SECRET"
+        required: false
+        type: string
+        default: ""
       core_release_tag:
         description: "OEAv2-Core release tag to deploy"
         required: true
@@ -73,6 +91,8 @@ jobs:
           ALLOW_DEV: ${{ inputs.allow_dev_tags }}
           DRY_RUN: ${{ inputs.dry_run }}
           ENV_NAME: ${{ inputs.environment_name }}
+          ENTRA_TENANT_ID: ${{ inputs.entra_tenant_id }}
+          CREDENTIAL_SET: ${{ inputs.credential_set }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
@@ -94,6 +114,14 @@ jobs:
           # --- workspace ---
           if ! [[ "$WORKSPACE_ID" =~ $GUID ]]; then
             fail "workspace_id '$WORKSPACE_ID' is not a valid GUID (expected 8-4-4-4-12 hex digits)."
+          fi
+
+          # --- connection details (both optional) ---
+          if [ -n "$ENTRA_TENANT_ID" ] && ! [[ "$ENTRA_TENANT_ID" =~ $GUID ]]; then
+            fail "entra_tenant_id '$ENTRA_TENANT_ID' is not a valid GUID. Leave it blank to use the default tenant."
+          fi
+          if [ -n "$CREDENTIAL_SET" ] && ! [[ "$CREDENTIAL_SET" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+            fail "credential_set '$CREDENTIAL_SET' is invalid (letters, digits and underscores only, starting with a letter). Leave it blank for the default credentials."
           fi
 
           # --- release tag format ---
@@ -147,6 +175,9 @@ jobs:
             echo "modules_enabled=$ENABLED"
           } >> "$GITHUB_OUTPUT"
 
+          if [ -n "$ENTRA_TENANT_ID" ]; then ENTRA_SHOWN="\`$ENTRA_TENANT_ID\`"; else ENTRA_SHOWN="default"; fi
+          if [ -n "$CREDENTIAL_SET" ]; then CREDS_SHOWN="\`$CREDENTIAL_SET\`"; else CREDS_SHOWN="default service principal"; fi
+
           # Shown on the run page BEFORE the approval prompt: this is what reviewers check.
           {
             echo "### Deploy request"
@@ -156,6 +187,8 @@ jobs:
             echo "|---|---|"
             echo "| Tenant | \`$TENANT\` |"
             echo "| Workspace | \`$WORKSPACE_ID\` |"
+            echo "| Entra tenant | $ENTRA_SHOWN |"
+            echo "| Credentials | $CREDS_SHOWN |"
             echo "| Core release | \`$CORE_TAG\` |"
             echo "| Modules | ${ENABLED//,/, } |"
             echo "| Approval environment | \`$ENV_NAME\` |"
@@ -163,16 +196,34 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo "Validation passed: tenant '$TENANT', workspace '$WORKSPACE_ID', core release '$CORE_TAG', modules: ${ENABLED//,/, }."
 
-      # GitHub silently CREATES any environment a job references if it doesn't
-      # exist, with no reviewers, which would skip the Prod approval gate
-      # entirely. Fail closed on that. This checks the ONE shared Prod environment
-      # (never the tenant), so a new tenant needs no setup anywhere.
-      - name: Verify environment has required reviewers
+      # The Prod approval gate is the GitHub Environment named in environment_name with
+      # required reviewers. Reviewers see the Deploy request above before approving.
+      #
+      # GitHub silently CREATES an environment a job references if it doesn't exist, with
+      # no reviewers, i.e. NO approval. So this step makes the situation visible:
+      #   - by default it WARNS and writes a banner on the run page, then continues;
+      #   - set the repository variable REQUIRE_PROD_APPROVAL to "true" and it FAILS instead,
+      #     so a Prod deploy can never run without an approval gate. Recommended once real.
+      - name: Check the approval gate
         if: ${{ inputs.require_protected_environment }}
         env:
           GH_TOKEN: ${{ github.token }}
           ENV_NAME: ${{ inputs.environment_name }}
+          STRICT: ${{ vars.REQUIRE_PROD_APPROVAL }}
         run: |
+          problem() {
+            if [ "$STRICT" = "true" ]; then
+              echo "::error::$1 REQUIRE_PROD_APPROVAL is true, so this run is refused."
+              exit 1
+            fi
+            echo "::warning::$1 This Prod deploy will run WITHOUT an approval step."
+            {
+              echo "### No approval gate on this Prod deploy"
+              echo "$1 Nobody is asked to approve this run. To require approval, add required reviewers to the \`$ENV_NAME\` environment (Settings, Environments). To make that mandatory, set the repository variable \`REQUIRE_PROD_APPROVAL\` to \`true\`."
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 0
+          }
+
           set +e
           BODY=$(gh api "repos/${GITHUB_REPOSITORY}/environments/${ENV_NAME}" 2>err.txt)
           RC=$?
@@ -180,17 +231,15 @@ jobs:
 
           if [ "$RC" -ne 0 ]; then
             if grep -q "404" err.txt; then
-              echo "::error::GitHub Environment '$ENV_NAME' does not exist. Running would auto-create it with no approval gate. Create it with required reviewers first."
-              exit 1
+              problem "GitHub Environment '$ENV_NAME' does not exist."
             fi
-            echo "::warning::Could not verify protection rules on environment '$ENV_NAME' ($(cat err.txt)). Confirm required reviewers are configured."
+            echo "::warning::Could not check the approval gate on environment '$ENV_NAME' ($(cat err.txt)). Confirm required reviewers are configured."
             exit 0
           fi
 
           REVIEWER_RULES=$(echo "$BODY" | jq '[.protection_rules[]? | select(.type=="required_reviewers")] | length')
           if [ "$REVIEWER_RULES" -eq 0 ]; then
-            echo "::error::Environment '$ENV_NAME' has no required reviewers. Refusing to deploy to Prod without an approval gate."
-            exit 1
+            problem "Environment '$ENV_NAME' has no required reviewers."
           fi
           echo "Environment '$ENV_NAME' has required reviewers configured."
 
@@ -245,23 +294,57 @@ jobs:
         if: ${{ !inputs.dry_run }}
         id: get_token
         env:
-          SERVICE_PRINCIPAL_TENANT_ID: ${{ secrets.SERVICE_PRINCIPAL_TENANT_ID }}
-          SERVICE_PRINCIPAL_CLIENT_ID: ${{ secrets.SERVICE_PRINCIPAL_CLIENT_ID }}
-          SERVICE_PRINCIPAL_CLIENT_SECRET: ${{ secrets.SERVICE_PRINCIPAL_CLIENT_SECRET }}
+          CREDENTIAL_SET: ${{ inputs.credential_set }}
+          ENTRA_TENANT_ID: ${{ inputs.entra_tenant_id }}
+          DEFAULT_TENANT_ID: ${{ secrets.SERVICE_PRINCIPAL_TENANT_ID }}
+          DEFAULT_CLIENT_ID: ${{ secrets.SERVICE_PRINCIPAL_CLIENT_ID }}
+          DEFAULT_CLIENT_SECRET: ${{ secrets.SERVICE_PRINCIPAL_CLIENT_SECRET }}
+          SET_TENANT_ID: ${{ secrets[format('SPN_{0}_TENANT_ID', inputs.credential_set)] }}
+          SET_CLIENT_ID: ${{ secrets[format('SPN_{0}_CLIENT_ID', inputs.credential_set)] }}
+          SET_CLIENT_SECRET: ${{ secrets[format('SPN_{0}_CLIENT_SECRET', inputs.credential_set)] }}
         run: |
-          # Same client-credentials pattern already used elsewhere in this
-          # repo (see the disabled notebook_update.yml/manual.yml).
-          for VAR in SERVICE_PRINCIPAL_TENANT_ID SERVICE_PRINCIPAL_CLIENT_ID SERVICE_PRINCIPAL_CLIENT_SECRET; do
-            if [ -z "${!VAR}" ]; then
-              echo "::error::secret $VAR is empty or not available to this environment"
+          # The secret itself never comes from the form: the form only chooses WHICH
+          # stored secret to use and which Entra tenant to log in to.
+          if [ -n "$CREDENTIAL_SET" ]; then
+            SET_UPPER=$(echo "$CREDENTIAL_SET" | tr '[:lower:]' '[:upper:]')
+            CLIENT_ID="$SET_CLIENT_ID"
+            CLIENT_SECRET="$SET_CLIENT_SECRET"
+            TENANT="${ENTRA_TENANT_ID:-$SET_TENANT_ID}"
+            if [ -z "$CLIENT_ID" ]; then
+              echo "::error::GitHub secret SPN_${SET_UPPER}_CLIENT_ID is not set (needed because credential_set is '$CREDENTIAL_SET')."
               exit 1
             fi
-          done
+            if [ -z "$CLIENT_SECRET" ]; then
+              echo "::error::GitHub secret SPN_${SET_UPPER}_CLIENT_SECRET is not set (needed because credential_set is '$CREDENTIAL_SET')."
+              exit 1
+            fi
+            SOURCE="credential set '$CREDENTIAL_SET'"
+            TENANT_HINT="type it into entra_tenant_id or set the GitHub secret SPN_${SET_UPPER}_TENANT_ID"
+          else
+            CLIENT_ID="$DEFAULT_CLIENT_ID"
+            CLIENT_SECRET="$DEFAULT_CLIENT_SECRET"
+            TENANT="${ENTRA_TENANT_ID:-$DEFAULT_TENANT_ID}"
+            if [ -z "$CLIENT_ID" ]; then
+              echo "::error::GitHub secret SERVICE_PRINCIPAL_CLIENT_ID is not set or not available to this environment."
+              exit 1
+            fi
+            if [ -z "$CLIENT_SECRET" ]; then
+              echo "::error::GitHub secret SERVICE_PRINCIPAL_CLIENT_SECRET is not set or not available to this environment."
+              exit 1
+            fi
+            SOURCE="the default service principal"
+            TENANT_HINT="type it into entra_tenant_id or set the GitHub secret SERVICE_PRINCIPAL_TENANT_ID"
+          fi
+          if [ -z "$TENANT" ]; then
+            echo "::error::No Entra tenant ID: $TENANT_HINT."
+            exit 1
+          fi
+          echo "Logging in to Entra tenant $TENANT as $SOURCE."
 
-          RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/${SERVICE_PRINCIPAL_TENANT_ID}/oauth2/v2.0/token" \
+          RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "client_id=${SERVICE_PRINCIPAL_CLIENT_ID}" \
-            -d "client_secret=${SERVICE_PRINCIPAL_CLIENT_SECRET}" \
+            -d "client_id=${CLIENT_ID}" \
+            -d "client_secret=${CLIENT_SECRET}" \
             -d "scope=https://api.fabric.microsoft.com/.default" \
             -d "grant_type=client_credentials")
 
@@ -279,23 +362,77 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
+      # Every workspace has its own copy of the deployment notebook, under the same name.
+      # Look it up by name there, so no notebook ID is stored anywhere. The name defaults
+      # to "Deployment Script"; set the repository VARIABLE DEPLOYMENT_NOTEBOOK_NAME to
+      # your notebook's real name (no code change needed).
+      - name: Find the deployment notebook in the workspace
+        if: ${{ !inputs.dry_run }}
+        id: find
+        env:
+          TOKEN: ${{ steps.get_token.outputs.token }}
+          WORKSPACE_ID: ${{ inputs.workspace_id }}
+          NOTEBOOK_NAME: ${{ vars.DEPLOYMENT_NOTEBOOK_NAME || 'Deployment Script' }}
+        run: |
+          URL="https://api.fabric.microsoft.com/v1/workspaces/${WORKSPACE_ID}/notebooks"
+          MATCHES="[]"
+          NAMES="[]"
+          NEXT=""
+
+          for _ in $(seq 1 50); do
+            ARGS=()
+            if [ -n "$NEXT" ]; then
+              ARGS=(--data-urlencode "continuationToken=${NEXT}")
+            fi
+            HTTP=$(curl -s -G -o page.json -w "%{http_code}" "$URL" "${ARGS[@]}" -H "Authorization: Bearer ${TOKEN}")
+
+            case "$HTTP" in
+              200) ;;
+              401|403)
+                echo "::error::Fabric refused access to workspace ${WORKSPACE_ID} (HTTP ${HTTP}). The service principal must be a member of that workspace (Contributor or higher), and the tenant must allow service principals to use Fabric APIs."
+                exit 1 ;;
+              404)
+                echo "::error::Workspace ${WORKSPACE_ID} was not found (HTTP 404), or the service principal cannot see it. Check the workspace ID and the Entra tenant."
+                exit 1 ;;
+              *)
+                echo "::error::Listing notebooks in workspace ${WORKSPACE_ID} failed (HTTP ${HTTP})."
+                cat page.json
+                exit 1 ;;
+            esac
+
+            MATCHES=$(jq -c --argjson acc "$MATCHES" --arg n "$NOTEBOOK_NAME" '$acc + [.value[]? | select(.displayName == $n) | .id]' page.json)
+            NAMES=$(jq -c --argjson acc "$NAMES" '$acc + [.value[]?.displayName]' page.json)
+            NEXT=$(jq -r '.continuationToken // empty' page.json)
+            if [ -z "$NEXT" ]; then
+              break
+            fi
+          done
+
+          COUNT=$(echo "$MATCHES" | jq 'length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No notebook named '${NOTEBOOK_NAME}' in workspace ${WORKSPACE_ID}. Notebooks found there: $(echo "$NAMES" | jq -r 'if length == 0 then "none" else (.[:10] | join(", ")) end'). Import the deployment notebook into the workspace, or set the repository variable DEPLOYMENT_NOTEBOOK_NAME to its actual name."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::${COUNT} notebooks are named '${NOTEBOOK_NAME}' in workspace ${WORKSPACE_ID}. Keep exactly one."
+            exit 1
+          fi
+
+          NOTEBOOK_ID=$(echo "$MATCHES" | jq -r '.[0]')
+          echo "Found '${NOTEBOOK_NAME}' in the workspace: ${NOTEBOOK_ID}"
+          echo "notebook_id=$NOTEBOOK_ID" >> "$GITHUB_OUTPUT"
+
       - name: Trigger deployment notebook run
         if: ${{ !inputs.dry_run }}
         id: trigger
         env:
           TOKEN: ${{ steps.get_token.outputs.token }}
-          DEPLOYMENT_NOTEBOOK_WORKSPACE_ID: ${{ secrets.DEPLOYMENT_NOTEBOOK_WORKSPACE_ID }}
-          DEPLOYMENT_NOTEBOOK_ID: ${{ secrets.DEPLOYMENT_NOTEBOOK_ID }}
+          WORKSPACE_ID: ${{ inputs.workspace_id }}
+          NOTEBOOK_ID: ${{ steps.find.outputs.notebook_id }}
         run: |
-          for VAR in DEPLOYMENT_NOTEBOOK_WORKSPACE_ID DEPLOYMENT_NOTEBOOK_ID; do
-            if [ -z "${!VAR}" ]; then
-              echo "::error::secret $VAR is empty or not available to this environment"
-              exit 1
-            fi
-          done
-
+          # The notebook runs in the SAME workspace it deploys into.
           HTTP_CODE=$(curl -s -D headers.txt -o body.json -w "%{http_code}" -X POST \
-            "https://api.fabric.microsoft.com/v1/workspaces/${DEPLOYMENT_NOTEBOOK_WORKSPACE_ID}/items/${DEPLOYMENT_NOTEBOOK_ID}/jobs/instances?jobType=RunNotebook" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${WORKSPACE_ID}/items/${NOTEBOOK_ID}/jobs/instances?jobType=RunNotebook" \
             -H "Authorization: Bearer ${TOKEN}" \
             -H "Content-Type: application/json" \
             --data @request.json)
@@ -352,6 +489,7 @@ jobs:
         id: outcome
         env:
           TOKEN_OUTCOME: ${{ steps.get_token.outcome }}
+          FIND_OUTCOME: ${{ steps.find.outcome }}
           TRIGGER_OUTCOME: ${{ steps.trigger.outcome }}
           POLL_OUTCOME: ${{ steps.poll.outcome }}
           POLL_REASON: ${{ steps.poll.outputs.reason }}
@@ -359,6 +497,8 @@ jobs:
           REASON=""
           if [ "$TOKEN_OUTCOME" = "failure" ]; then
             REASON="Could not get a Fabric access token (step 'Get Fabric access token')."
+          elif [ "$FIND_OUTCOME" = "failure" ]; then
+            REASON="Could not find or reach the deployment notebook in the target workspace (step 'Find the deployment notebook in the workspace')."
           elif [ "$TRIGGER_OUTCOME" = "failure" ]; then
             REASON="Fabric did not accept the run request (step 'Trigger deployment notebook run')."
           elif [ "$POLL_OUTCOME" = "failure" ]; then
