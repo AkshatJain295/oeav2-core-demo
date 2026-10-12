@@ -1,22 +1,32 @@
 name: Deploy to Prod (per tenant)
 
+# Nothing about a tenant is stored in the repo: you supply the workspace, the modules
+# and the release each time, and the tenant's reviewers approve exactly those values.
 on:
   workflow_dispatch:
     inputs:
       tenant:
-        description: "Must match a configs/<tenant>.json file on main, e.g. tenant-a"
+        description: "Tenant name. Must match a GitHub Environment that has required reviewers, e.g. tenant-a"
+        required: true
+      workspace_id:
+        description: "GUID of the tenant's Fabric workspace (reviewers will check it before approving)"
         required: true
       core_release_tag:
         description: "Production tag only (vYYYY.MM.<n>), e.g. v2026.09.1"
         required: true
+      modules:
+        description: "Modules to deploy: edit the true/false values"
+        required: true
+        default: '{"fetch_releases":true,"create_folders":false,"create_environment":true,"create_lakehouses":true,"deploy_notebooks":true,"deploy_dashboards":false,"bootstrap_and_rebind":false}'
       dry_run:
         description: "Run every check and approval but make no call to Fabric"
         type: boolean
         required: false
         default: false
 
+# contents: write is needed only by the record job, which writes the deployment log.
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
@@ -36,10 +46,12 @@ jobs:
     needs: guard
     uses: ./.github/workflows/deploy-notebook.yml
     with:
-      target_config_name: ${{ inputs.tenant }}
+      tenant: ${{ inputs.tenant }}
+      workspace_id: ${{ inputs.workspace_id }}
       core_release_tag: ${{ inputs.core_release_tag }}
-      # Environment name = tenant name, by convention (matches configs/<tenant>.json).
-      # The environment carries that tenant's required reviewers.
+      modules: ${{ inputs.modules }}
+      # Environment name = tenant name. The environment carries that tenant's
+      # required reviewers, and a name with no such environment is rejected.
       environment_name: ${{ inputs.tenant }}
       allow_dev_tags: false
       require_protected_environment: true
