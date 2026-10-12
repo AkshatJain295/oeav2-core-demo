@@ -17,7 +17,7 @@ on:
   workflow_call:
     inputs:
       tenant:
-        description: "Label for this target: the GitHub Environment name (approval gate) and the name shown in the deployment log"
+        description: "Label for this target, shown in the approval summary and the deployment log. Nothing looks it up."
         required: true
         type: string
       workspace_id:
@@ -33,7 +33,7 @@ on:
         required: true
         type: string
       environment_name:
-        description: "GitHub Environment to run under (Prod environments carry the required reviewers)"
+        description: "GitHub Environment to run under: dev, qa, or the shared production environment that carries the required reviewers"
         required: true
         type: string
       allow_dev_tags:
@@ -158,43 +158,15 @@ jobs:
             echo "| Workspace | \`$WORKSPACE_ID\` |"
             echo "| Core release | \`$CORE_TAG\` |"
             echo "| Modules | ${ENABLED//,/, } |"
+            echo "| Approval environment | \`$ENV_NAME\` |"
             echo "| Dry run | $DRY_RUN |"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo "Validation passed: tenant '$TENANT', workspace '$WORKSPACE_ID', core release '$CORE_TAG', modules: ${ENABLED//,/, }."
 
-      # Optional guard against deploying one tenant's release into another tenant's
-      # workspace. If the GitHub Environment has a variable named WORKSPACE_ID, the
-      # workspace_id you typed must match it. No variable = no check.
-      - name: Cross-check workspace against the environment's registered workspace
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          ENV_NAME: ${{ inputs.environment_name }}
-          WORKSPACE_ID: ${{ inputs.workspace_id }}
-        run: |
-          set +e
-          REGISTERED=$(gh api "repos/${GH_REPO}/environments/${ENV_NAME}/variables/WORKSPACE_ID" --jq .value 2>err.txt)
-          RC=$?
-          set -e
-
-          if [ "$RC" -ne 0 ]; then
-            if grep -q "404" err.txt; then
-              echo "::notice::Environment '$ENV_NAME' has no WORKSPACE_ID variable, so the workspace ID was not cross-checked. Reviewers: verify it by eye."
-            else
-              echo "::warning::Could not read the registered workspace for environment '$ENV_NAME' ($(cat err.txt)). The workspace ID was not cross-checked."
-            fi
-            exit 0
-          fi
-
-          if [ "${REGISTERED,,}" != "${WORKSPACE_ID,,}" ]; then
-            echo "::error::workspace_id $WORKSPACE_ID does not match the workspace registered for environment '$ENV_NAME' ($REGISTERED). Check you chose the right tenant and workspace."
-            exit 1
-          fi
-          echo "workspace_id matches the workspace registered for environment '$ENV_NAME'."
-
       # GitHub silently CREATES any environment a job references if it doesn't
       # exist, with no reviewers, which would skip the Prod approval gate
-      # entirely. Fail closed on that. This is also what stops a typo'd tenant.
+      # entirely. Fail closed on that. This checks the ONE shared Prod environment
+      # (never the tenant), so a new tenant needs no setup anywhere.
       - name: Verify environment has required reviewers
         if: ${{ inputs.require_protected_environment }}
         env:
