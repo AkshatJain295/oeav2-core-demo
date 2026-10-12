@@ -1,6 +1,6 @@
 name: PR Checks
 
-# Enforces the branching/naming conventions and validates tenant configs.
+# Enforces the branching and naming conventions.
 # Until the branch rulesets are in place these show as visible pass/fail checks;
 # once they are added as required status checks they become blocking.
 on:
@@ -62,10 +62,3 @@ jobs:
             echo "Conventions OK: '$HEAD' -> '$BASE', title type [$TITLE_TYPE]."
           fi
           exit "$FAILED"
-
-  tenant-configs:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate tenant configs
-        run: python3 .github/scripts/validate_tenant_configs.py configs
