@@ -5,6 +5,7 @@ name: Deploy to Prod (per tenant)
 # only a label (it appears in the approval and the deployment log); nothing looks it up.
 # Every Prod deploy waits for approval from the reviewers of ONE shared GitHub
 # Environment named "production", who check the exact values before approving.
+# The notebook runs INSIDE the workspace you name, found by its display name there.
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +15,14 @@ on:
       workspace_id:
         description: "GUID of the tenant's Fabric workspace (reviewers check it before approving)"
         required: true
+      entra_tenant_id:
+        description: "Entra tenant ID that owns the workspace. Leave blank for our own (default) tenant"
+        required: false
+        default: ""
+      credential_set:
+        description: "Leave blank for the default service principal. Or a name, e.g. acme, to use the GitHub secrets SPN_ACME_CLIENT_ID / SPN_ACME_CLIENT_SECRET"
+        required: false
+        default: ""
       core_release_tag:
         description: "Production tag only (vYYYY.MM.<n>), e.g. v2026.09.1"
         required: true
@@ -51,12 +60,15 @@ jobs:
     with:
       tenant: ${{ inputs.tenant }}
       workspace_id: ${{ inputs.workspace_id }}
+      entra_tenant_id: ${{ inputs.entra_tenant_id }}
+      credential_set: ${{ inputs.credential_set }}
       core_release_tag: ${{ inputs.core_release_tag }}
       modules: ${{ inputs.modules }}
       # One shared Prod environment, created once in GitHub with required reviewers.
-      # It is the approval gate for every tenant. The workflow refuses to run if it
-      # is missing or has no reviewers, because GitHub would otherwise auto-create
-      # it with no gate at all.
+      # It is the approval gate for every tenant. If it is missing or has no reviewers
+      # the run warns loudly (and is refused if the repository variable
+      # REQUIRE_PROD_APPROVAL is "true"), because GitHub would otherwise auto-create it
+      # with no gate at all.
       environment_name: "production"
       allow_dev_tags: false
       require_protected_environment: true
